@@ -82,6 +82,7 @@ class Unicycle2(DynamicsSimulator):
         x, y, theta, v, omega = state_array
         a_v, a_omega = clipped_action
 
+        # double integrator 的模型，首先用v/w对pose进行积分，然后再用输出的control action对v/w进行积分
         x = x + v * np.cos(theta) * self.dt
         y = y + v * np.sin(theta) * self.dt
         theta = np.arctan2(np.sin(theta + omega * self.dt), np.cos(theta + omega * self.dt))
@@ -95,6 +96,7 @@ class Unicycle2(DynamicsSimulator):
         """
         rotates a global 2D vector by -theta into the robot body frame
         """
+        # 将global state转换为相对位置
         state_array = self.validate_state(state)
         theta = state_array[2]
         ego_x = np.cos(theta) * vec[0] + np.sin(theta) * vec[1]
@@ -110,6 +112,8 @@ class Unicycle2(DynamicsSimulator):
         rel_pos = self.goal[0:2] - state_array[0:2]
         ego_pos = self.global_vector_to_ego(rel_pos, state_array)
         rel_theta = np.arctan2(np.sin(self.goal[2] - state_array[2]), np.cos(self.goal[2] - state_array[2]))
+
+        # observation里包含相对位置，相对朝向，以及自身的速度和角速度
         obs = np.array(
             [
                 ego_pos[0],
@@ -161,6 +165,7 @@ class Unicycle2(DynamicsSimulator):
         pos_error = np.linalg.norm(state_array[0:2] - self.goal[0:2])
         theta_error = abs(np.arctan2(np.sin(self.goal[2] - state_array[2]), np.cos(self.goal[2] - state_array[2])))
 
+        # 这里限制朝向也要正确才能terminate
         return (
             pos_error < self.pos_tol
             and theta_error < self.theta_tol
