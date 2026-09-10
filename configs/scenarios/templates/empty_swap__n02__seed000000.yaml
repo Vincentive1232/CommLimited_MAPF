@@ -1,0 +1,30 @@
+schema_version: 1
+scenario_id: empty_swap__n02__seed000000
+family: empty_swap
+seed: 0
+split: diagnostic
+
+environment:
+  environment_id: empty_8x8
+  min: [0.0, 0.0]
+  max: [8.0, 8.0]
+  obstacles: []
+
+
+geometries:
+  disk_r030:
+    radius: 0.30
+
+
+robots:
+  - robot_id: robot_0
+    model: single_integrator
+    geometry: disk_r030
+    start: [2.0, 4.0]
+    goal: [6.0, 4.0]
+
+  - robot_id: robot_1
+    model: single_integrator
+    geometry: disk_r030
+    start: [6.0, 4.0]
+    goal: [2.0, 4.0]

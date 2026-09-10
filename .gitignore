@@ -20,6 +20,8 @@ learning/__pycache__/
 learning/models/__pycache__/
 learning/dagger/__pycache__/
 
+scenarios/__pycache__/
+
 test/*.pdf
 test/*.mp4
 
