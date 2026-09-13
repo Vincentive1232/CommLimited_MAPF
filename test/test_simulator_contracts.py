@@ -769,6 +769,38 @@ class SimulatorContractTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             validate_system_config(system_name="multi_robot", raw_config=raw_config)
 
+    def test_multi_robot_requires_identical_per_robot_max_action(self) -> None:
+        """Regression guard: a decentralized policy shares one set of
+        weights across every robot with no robot-identity input at all --
+        if per-robot actuator limits differed, the same observation
+        encoding would legitimately warrant a different "correct" action
+        depending on which robot executes it. MultiRobotSimulator's
+        homogeneity check used to only verify matching simulator
+        type/dimensions, silently permitting this; it must reject a
+        mismatch outright instead.
+        """
+        def two_unicycle2_robots(max_linear_accels: tuple[float, float]) -> dict:
+            return {
+                "dt": 0.05,
+                "d_safe": 1.2,
+                "d_collision": 1.0,
+                "robots": [
+                    {"system": "unicycle2", "config": {"max_linear_accel": max_linear_accels[0]}},
+                    {"system": "unicycle2", "config": {"max_linear_accel": max_linear_accels[1]}},
+                ],
+            }
+
+        matching = validate_system_config(
+            system_name="multi_robot", raw_config=two_unicycle2_robots((3.0, 3.0))
+        )
+        DynamicsFactory.create(system_name="multi_robot", config=matching)  # must not raise
+
+        mismatched = validate_system_config(
+            system_name="multi_robot", raw_config=two_unicycle2_robots((3.0, 5.0))
+        )
+        with self.assertRaises(ValueError):
+            DynamicsFactory.create(system_name="multi_robot", config=mismatched)
+
 
 if __name__ == "__main__":
     unittest.main()

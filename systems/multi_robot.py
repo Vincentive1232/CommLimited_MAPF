@@ -163,11 +163,13 @@ class MultiRobotSimulator(DynamicsSimulator):
         if np.any(self.robot_visibility_radii < 0):
             raise ValueError("Visibility radii must be non-negative.")
 
-        # Used by some planners as a symmetric control bound fallback --
-        # a single worst-case-over-every-dimension-and-robot scalar, not a
-        # precise per-action-dimension bound (a sub-sim's own max_action can
-        # itself be a per-dimension array, e.g. unicycle2's independent
-        # [a_v, a_omega] limits).
+        # Used by some planners as a symmetric control bound fallback -- a
+        # single worst-case-over-every-action-dimension scalar, not a
+        # precise per-dimension bound (a sub-sim's own max_action can itself
+        # be a per-dimension array, e.g. unicycle2's independent
+        # [a_v, a_omega] limits). Every robot's own max_action is required
+        # (below) to already agree, so this collapses dimensions only, never
+        # robots.
         self.max_action = float(max(np.max(sim.max_action) for sim in self.simulators))
         self.d_safe = float(self.config.get("d_safe", 0.0))
         self.d_collision = float(self.config.get("d_collision", self.d_safe))
@@ -183,6 +185,25 @@ class MultiRobotSimulator(DynamicsSimulator):
             raise ValueError(
                 "MultiRobotSimulator only supports strictly homogeneous teams (same simulator type and dimensions)."
             )
+        # A decentralized policy shares one set of weights across the whole
+        # fleet (see build_decentralized_joint_action) with no robot-identity
+        # input at all -- if per-robot actuator limits differed, the same
+        # observation encoding would legitimately warrant a different
+        # "correct" action depending on which physical robot executes it,
+        # which a policy trained this way has no way to infer. That's a
+        # property of the shared-weights architecture itself, not of any one
+        # policy type (flow/safeflow's action_scale normalization just makes
+        # a mismatch numerically visible first) -- so it's enforced here,
+        # once, for every caller, rather than separately per policy type.
+        reference_max_action = np.asarray(self.simulators[0].max_action, dtype=float)
+        for robot_idx, sim in enumerate(self.simulators[1:], start=1):
+            robot_max_action = np.asarray(sim.max_action, dtype=float)
+            if not np.array_equal(robot_max_action, reference_max_action):
+                raise ValueError(
+                    "MultiRobotSimulator requires every robot to share identical max_action "
+                    f"limits; robot 0 has {reference_max_action.tolist()} but robot {robot_idx} "
+                    f"has {robot_max_action.tolist()}."
+                )
         self._casadi_mapped_dynamics: ca.Function | None = None
 
     @property

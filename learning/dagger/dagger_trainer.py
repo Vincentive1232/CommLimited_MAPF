@@ -183,8 +183,9 @@ class DaggerTrainer:
                 # own docstring for why its diffusion-style training needs
                 # this to keep every action dimension on comparable footing
                 # against its isotropic unit-scale noise prior. Homogeneous
-                # fleet (validated elsewhere), so simulators[0] speaks for
-                # every robot's own action bound.
+                # fleet (MultiRobotSimulator itself requires identical
+                # per-robot max_action), so simulators[0] speaks for every
+                # robot's own action bound.
                 "action_scale": np.broadcast_to(
                     np.asarray(self.simulator.simulators[0].max_action, dtype=float),
                     (self.action_dim,),
