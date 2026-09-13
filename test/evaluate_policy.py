@@ -616,6 +616,42 @@ def run_evaluation(
     policy.eval()
     policy.to(device)
 
+    # torch.compile(...) on FlowPolicy.net (see FlowPolicy.__init__) and,
+    # for safeflow, SafeFlowMPCPolicy's ThreadPoolExecutor worker threads
+    # are both lazily initialized on the *first* real select_action call --
+    # without this untimed warm-up, that one-time cost would land inside
+    # the very first sample of the timed solve_times benchmark below, which
+    # can dominate (or even define) the reported mean for a short
+    # evaluation. The state/observation values themselves are irrelevant
+    # (this call's action is discarded) so an all-zero state is fine; reset
+    # afterward so this doesn't leave the policy's own internal state
+    # (e.g. a SafeFlow projector's warm-start cache) primed for it.
+    warmup_history_buffer = (
+        ObservationHistoryBuffer(observation_horizon, int(simulator.num_robots))
+        if observation_horizon > 1
+        else None
+    )
+    try:
+        build_decentralized_joint_action(
+            simulator=simulator,
+            policy=policy,
+            observation=simulator.observe(np.zeros(simulator.nx)),
+            device=device,
+            observation_horizon=observation_horizon,
+            history_buffer=warmup_history_buffer,
+        )
+    except PlannerSolveError:
+        # All-zero is a valid *shape* for any system, but for multi_robot it
+        # puts every robot at the exact same position -- a guaranteed
+        # collision-constraint violation, which SafeFlow's projector (with
+        # no warm-start cache yet to fall back on) can't solve around. Both
+        # of this warm-up's actual goals (compiling FlowPolicy.net, spawning
+        # the projector thread pool) already happened before the projection
+        # itself raised, so a failed solve here is harmless -- the point was
+        # never this call's returned action.
+        pass
+    policy.reset()
+
     # Instantiate expert planner once and reset it for each rollout.
     expert_planner = PlannerFactory.create(planner_name="casadi", simulator=simulator, config=validated_config)
     expert_trajectories: list[np.ndarray] = []

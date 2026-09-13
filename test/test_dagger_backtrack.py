@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import torch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -796,6 +797,53 @@ class BacktrackRecoveryEscalationTests(unittest.TestCase):
         # pass continuing past s_0.3 would have produced.
         np.testing.assert_allclose(policy_calls, [[0.0], [0.1], [0.3]])
 
+    def test_phase_two_replay_survives_a_planner_solve_error_from_a_stale_cache(self) -> None:
+        """Regression guard: policy_reset_fn() (called right before replay)
+        clears a SafeFlow policy's projector warm-start cache, so replaying
+        the prefix can hit a cold-start PlannerSolveError with no cached
+        fallback trajectory to lean on. That must not escape and abort the
+        whole collection run -- the replayed action is discarded either way,
+        and history_buffer is already updated before the policy forward
+        pass/projection that would raise.
+        """
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
+        planner = _SequencedPlanner(actions=[[0.1], [0.2], [100.0], [0.8]])
+        policy_calls = 0
+
+        def flaky_policy(observation: np.ndarray) -> np.ndarray:
+            nonlocal policy_calls
+            policy_calls += 1
+            if policy_calls == 1:
+                raise PlannerSolveError("forced cold-start solve failure")
+            return np.array([0.8])
+
+        writer = _FakeDatasetWriter()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            metrics = collect_dagger_rollouts(
+                simulator=simulator,
+                expert_planner=planner,
+                dataset_writer=writer,
+                trajectories_per_iteration=1,
+                steps_per_trajectory=3,
+                action_noise_std=0.0,
+                action_noise_seed=0,
+                initial_state_seed=0,
+                expert_mixing_beta=1.0,
+                policy_action_fn=flaky_policy,
+                frame_builder=_frame_builder,
+                initial_states=[[0.0]],
+                goal_states=None,
+                beta_recovery=0.5,
+                beta_recovery_increment=1.0,
+            )
+
+        self.assertEqual(metrics.num_episodes, 1)
+        self.assertEqual(metrics.success_rate, 1.0)
+        # 2 replay calls (s_0.0 raises, s_0.1 succeeds) + 1 live query at the
+        # candidate itself.
+        self.assertEqual(policy_calls, 3)
+
 
 class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
     """A flow/safeflow policy's inference draws from an unseeded torch.randn
@@ -849,6 +897,26 @@ class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
                     action_fn=lambda observation: np.array([0.0]),
                 )
         self.assertEqual(seeds_seen[0], seeds_seen[1])
+
+    def test_global_torch_rng_state_is_restored_after_evaluation(self) -> None:
+        """Regression guard: torch.manual_seed(...) mutates the same
+        process-wide generator(s) DAgger training's own compute_loss draws
+        from (e.g. FlowPolicy.compute_loss's torch.randn_like/torch.rand) --
+        pinning eval's own seed for reproducibility must not leak into the
+        next round's training noise sequence.
+        """
+        simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=1e9)
+        torch.manual_seed(12345)
+        before_state = torch.get_rng_state().clone()
+        evaluate_policy_rollouts(
+            simulator=simulator,
+            num_episodes=3,
+            num_steps=2,
+            seed_start=100,
+            action_fn=lambda observation: np.array([0.0]),
+        )
+        after_state = torch.get_rng_state()
+        self.assertTrue(torch.equal(before_state, after_state))
 
 
 class RestartInitialStateRoundTests(unittest.TestCase):

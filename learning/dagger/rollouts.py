@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from collections import deque
 from collections.abc import Callable, Mapping
 
@@ -405,7 +406,22 @@ def collect_dagger_rollouts(
                 if policy_reset_fn is not None:
                     policy_reset_fn()
                 for prefix_state in visited_states[:candidate_index]:
-                    policy_action_fn(simulator.observe(prefix_state))
+                    try:
+                        policy_action_fn(simulator.observe(prefix_state))
+                    except PlannerSolveError:
+                        # policy_reset_fn() just cleared SafeFlow's projector
+                        # warm-start cache, so this replay's first query is a
+                        # cold start with no cached fallback trajectory to
+                        # lean on -- exactly the case CasadiTrajectoryProjector
+                        # can't recover from itself (see its own
+                        # PlannerSolveError raise). Safe to ignore here only
+                        # because build_decentralized_joint_action appends to
+                        # history_buffer *before* running the policy forward
+                        # pass/projection, and this call's returned action is
+                        # discarded either way -- unlike choose_action's own
+                        # try/except below, which falls back to the expert
+                        # action because that one's result is actually used.
+                        pass
 
             def choose_action(observation: np.ndarray, expert_action: np.ndarray) -> tuple[np.ndarray, bool]:
                 # beta >= 1.0 (the default) short-circuits to the original
@@ -851,6 +867,34 @@ def rollout_policy_with_action_fn(
     return False, num_steps, "timeout"
 
 
+@contextlib.contextmanager
+def _isolated_torch_rng_state():
+    """Snapshots/restores torch's global RNG state(s) around a block.
+
+    torch.manual_seed(...) mutates the same process-wide generator(s) (CPU,
+    every CUDA device, MPS) that a flow/safeflow policy's own training
+    (FlowPolicy.compute_loss's torch.randn_like/torch.rand) and inference
+    (select_action's ODE noise) both draw from -- there's no separate "eval"
+    generator to scope a manual_seed call to. Without restoring the pre-eval
+    state afterward, pinning eval's own seed for reproducibility (see the
+    call site below) would leave the *next* DAgger round's training noise
+    sequence depending on how many eval episodes ran and how each rollout
+    played out -- a confound that has nothing to do with the policy actually
+    changing.
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    mps_state = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        if mps_state is not None:
+            torch.mps.set_rng_state(mps_state)
+
+
 def evaluate_policy_rollouts(
     simulator: DynamicsProtocol,
     num_episodes: int,
@@ -915,17 +959,20 @@ def evaluate_policy_rollouts(
         # action_noise_rng below even though both derive from the same
         # seed_spec -- the same pattern this module already uses to keep
         # action noise, initial-state sampling, and expert-mixing
-        # independent of each other.
-        torch.manual_seed(torch_inference_seed_for_rollout(action_noise_seed, seed_spec=seed_spec))
-        reached_goal, rollout_steps, failure_reason = rollout_policy_with_action_fn(
-            simulator=simulator,
-            initial_state=initial_state,
-            num_steps=num_steps,
-            action_fn=action_fn,
-            reset_fn=reset_fn,
-            action_noise_std=action_noise_std,
-            action_noise_rng=action_noise_rng_for_rollout(action_noise_seed, seed_spec=seed_spec),
-        )
+        # independent of each other. _isolated_torch_rng_state() restores
+        # torch's global RNG(s) once this rollout is done, so this eval-only
+        # seeding never leaks into the next DAgger round's own training.
+        with _isolated_torch_rng_state():
+            torch.manual_seed(torch_inference_seed_for_rollout(action_noise_seed, seed_spec=seed_spec))
+            reached_goal, rollout_steps, failure_reason = rollout_policy_with_action_fn(
+                simulator=simulator,
+                initial_state=initial_state,
+                num_steps=num_steps,
+                action_fn=action_fn,
+                reset_fn=reset_fn,
+                action_noise_std=action_noise_std,
+                action_noise_rng=action_noise_rng_for_rollout(action_noise_seed, seed_spec=seed_spec),
+            )
         successes += int(reached_goal)
         steps_taken.append(int(rollout_steps))
         if failure_reason == "collision":

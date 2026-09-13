@@ -498,7 +498,8 @@ class CasadiPlanner(Planner):
                 except RuntimeError as exc:
                     raise PlannerSolveError(
                         "CasADi planner solve failed in MPC mode (both warm-started and "
-                        "cold-restarted)."
+                        f"cold-restarted). Current state estimate: {x0.tolist()}, goal: "
+                        f"{self.sim.goal_state.tolist()}."
                     ) from exc
 
             self.last_X_sol = sol.value(self.X)
@@ -518,7 +519,8 @@ class CasadiPlanner(Planner):
                     self.cached_plan = sol.value(self.U)
                 except RuntimeError as exc:
                     raise PlannerSolveError(
-                        "CasADi planner solve failed in open-loop mode."
+                        "CasADi planner solve failed in open-loop mode. "
+                        f"Initial state estimate: {x0.tolist()}, goal: {self.sim.goal_state.tolist()}."
                     ) from exc
 
             # Iterate through the cached plan
