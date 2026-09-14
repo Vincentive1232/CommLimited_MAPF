@@ -435,7 +435,12 @@ class TerminalConditionSupportTests(unittest.TestCase):
         # solver should simply saturate toward it every step.
         u_ref = np.full((2, 3), 999.0)
         u_safe = projector.project(obs0, u_ref)
-        np.testing.assert_allclose(u_safe, sim.max_action, atol=1e-6)
+        max_action = np.asarray(sim.max_action)
+        np.testing.assert_allclose(
+            u_safe,
+            np.broadcast_to(max_action.reshape(-1, 1) if max_action.ndim else max_action, u_safe.shape),
+            atol=1e-6,
+        )
 
     def test_short_horizon_for_velocity_having_system_constructs_and_solves(self) -> None:
         # A horizon far shorter than the braking distance at max speed

@@ -100,8 +100,8 @@ class FlowPolicy(ActionPolicy):
                     f"'action_scale' must have shape ({self.action_dim},), got "
                     f"{tuple(action_scale_tensor.shape)}."
                 )
-            if bool((action_scale_tensor <= 0).any()):
-                raise ValueError("'action_scale' entries must all be positive.")
+            if bool((~torch.isfinite(action_scale_tensor)).any() or (action_scale_tensor <= 0).any()):
+                raise ValueError("'action_scale' entries must all be finite and positive.")
         # Non-persistent: this is config-derived (the fleet's own max_action),
         # not learned, and every current caller (train_dagger.py's
         # save_checkpoints/PolicyFactory.create, evaluate_policy.py's

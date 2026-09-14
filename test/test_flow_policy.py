@@ -50,6 +50,12 @@ class ActionScaleValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _build_policy(action_scale=[-1.0, 1.0])
 
+    def test_non_finite_entry_rejected(self) -> None:
+        for bad_value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad_value=bad_value):
+                with self.assertRaises(ValueError):
+                    _build_policy(action_scale=[1.0, bad_value])
+
     def test_omitted_defaults_to_all_ones(self) -> None:
         policy = _build_policy(action_scale=None)
         torch.testing.assert_close(policy.action_scale, torch.ones(2))
