@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -256,6 +257,8 @@ def _positive_vector(raw: Any, key: str, size: int) -> tuple[float, ...]:
 def _workspace_sampling(raw_config: Mapping[str, Any]) -> WorkspaceSamplingConfig:
     bounds = _vector(raw_config, "workspace_bounds", 2, (-1.0, 1.0))
     lower, upper = bounds
+    if not math.isfinite(lower) or not math.isfinite(upper):
+        raise ConfigurationError("'workspace_bounds' entries must all be finite.")
     if lower >= upper:
         raise ConfigurationError("'workspace_bounds[0]' must be smaller than 'workspace_bounds[1]'.")
     return WorkspaceSamplingConfig(

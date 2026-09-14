@@ -574,6 +574,20 @@ class SimulatorContractTests(unittest.TestCase):
         self.assertTrue(np.all(simulator.goal[:2] >= -1.0))
         self.assertTrue(np.all(simulator.goal[:2] <= 1.0))
 
+    def test_workspace_bounds_reject_non_finite_entries(self) -> None:
+        for bad_bounds in ([float("nan"), 1.0], [-1.0, float("inf")], [float("-inf"), 1.0]):
+            with self.subTest(bad_bounds=bad_bounds):
+                with self.assertRaises(ConfigurationError):
+                    validate_system_config(
+                        system_name="single_integrator",
+                        raw_config={
+                            "dt": 0.05,
+                            "goal": [0.0, 0.0],
+                            "randomize_goal": False,
+                            "workspace_bounds": bad_bounds,
+                        },
+                    )
+
     def test_workspace_position_is_uniform_over_bounds(self) -> None:
         simulator = DynamicsFactory.create(
             system_name="single_integrator",
