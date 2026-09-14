@@ -1,0 +1,151 @@
+From docker.io/library/ubuntu:22.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        ffmpeg \
+        git \
+        gnupg \
+        libboost-all-dev \
+        libeigen3-dev \
+        libfcl-dev \
+        libgl1 \
+        libglib2.0-0 \
+        liblz4-dev \
+        libmsgpack-dev \
+        liboctomap-dev \
+        libyaml-cpp-dev \
+        pkg-config \
+        software-properties-common \
+        unzip \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+
+RUN add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+RUN python3.12 -m venv "${VIRTUAL_ENV}" \
+    && python -m pip install --upgrade pip \
+    && python --version \
+    && python -m pip --version
+
+
+COPY requirements.txt /tmp/requirements.txt
+
+RUN python -m pip install \
+        torch==2.7.1 \
+        torchvision==0.22.1 \
+        --index-url https://download.pytorch.org/whl/cu128 \
+    && python -m pip install \
+        -r /tmp/requirements.txt \
+        PyYAML \
+        pytest \
+    && python -m pip check
+
+
+ENV OMPL_PREFIX=/opt/ompl
+
+ARG OMPL_REF=e2994e5
+ARG OMPL_BUILD_JOBS=2
+
+RUN git clone https://github.com/ompl/ompl.git /tmp/ompl \
+    && git -C /tmp/ompl checkout --detach "${OMPL_REF}" \
+    && mkdir -p /opt/build-metadata \
+    && git -C /tmp/ompl rev-parse HEAD \
+        > /opt/build-metadata/ompl.commit \
+    && /usr/bin/cmake -S /tmp/ompl -B /tmp/ompl/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${OMPL_PREFIX}" \
+        -DOMPL_BUILD_PYBIND11_BINDINGS=OFF \
+        -DOMPL_BUILD_EXAMPLES=OFF \
+        -DOMPL_BUILD_TESTS=OFF \
+        -DOMPL_BUILD_CMAKE_CONFIG=ON \
+    && /usr/bin/cmake --build /tmp/ompl/build \
+        --parallel "${OMPL_BUILD_JOBS}" \
+    && /usr/bin/cmake --install /tmp/ompl/build \
+    && rm -rf /tmp/ompl
+
+
+RUN curl -fsSL \
+        http://robotpkg.openrobots.org/packages/debian/robotpkg.key \
+        | gpg --dearmor -o /usr/share/keyrings/robotpkg.gpg \
+    && echo \
+        "deb [arch=amd64 signed-by=/usr/share/keyrings/robotpkg.gpg] http://robotpkg.openrobots.org/packages/debian/pub jammy robotpkg" \
+        > /etc/apt/sources.list.d/robotpkg.list \
+    && apt-get update \
+        && apt-get install -y --no-install-recommends \
+        robotpkg-py310-crocoddyl=2.1.0r1 \
+        robotpkg-py310-pinocchio=3.4.0 \
+        robotpkg-pinocchio=3.4.0 \
+        robotpkg-py310-eigenpy=3.10.3 \
+        robotpkg-py310-example-robot-data=4.2.0 \
+        robotpkg-example-robot-data=4.2.0 \
+        robotpkg-coal=3.0.1 \
+        robotpkg-py310-coal=3.0.1 \
+        robotpkg-casadi=3.6.7 \
+        robotpkg-py310-casadi=3.6.7 \
+        robotpkg-qpoases+doc=3.2.1r1 \
+        coinor-libipopt-dev \
+    && rm -rf /var/lib/apt/lists/*
+    # && apt-get install -y --no-install-recommends \
+    #     robotpkg-py310-crocoddyl=2.1.0r1 \
+    #     coinor-libipopt-dev \
+    # && rm -rf /var/lib/apt/lists/*
+
+
+ENV DB_LACAM_ROOT=/opt/db-lacam
+ENV CMAKE_PREFIX_PATH="/opt/ompl;/opt/openrobots"
+ENV LD_LIBRARY_PATH="/opt/ompl/lib:/opt/openrobots/lib"
+
+COPY third_party/db-lacam/ /opt/db-lacam/
+
+RUN /usr/bin/cmake \
+        -S "${DB_LACAM_ROOT}" \
+        -B "${DB_LACAM_ROOT}/buildRelease" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
+        -DBUILD_DYNOBENCH_TESTS=OFF \
+        -DBUILD_DYNOBENCH_PYBINDINGS=OFF
+
+ARG DB_LACAM_BUILD_JOBS=2
+
+RUN /usr/bin/cmake --build "${DB_LACAM_ROOT}/buildRelease" \
+        --target run_dblacam \
+        --parallel "${DB_LACAM_BUILD_JOBS}" \
+    && test -x "${DB_LACAM_ROOT}/buildRelease/run_dblacam"
+
+COPY data/dependencies/db-lacam-primitives.zip /tmp/primitives.zip
+
+RUN echo \
+        "f52afb14e391c8ad5d7b71e641917f6a2f65d627fbece76899246b4b62468190 /tmp/primitives.zip" \
+        | sha256sum --check - \
+    && unzip -q /tmp/primitives.zip \
+        'new_format_motions/integrator1_2d_v0/*' \
+        -d "${DB_LACAM_ROOT}" \
+    && test -s \
+        "${DB_LACAM_ROOT}/new_format_motions/integrator1_2d_v0/unit_length2/integrator1_2d_v0.bin.im.bin.sp.bin" \
+    && sha256sum \
+        "${DB_LACAM_ROOT}/new_format_motions/integrator1_2d_v0/unit_length2/integrator1_2d_v0.bin.im.bin.sp.bin" \
+        > /opt/build-metadata/integrator1-primitives.sha256 \
+    && rm /tmp/primitives.zip
