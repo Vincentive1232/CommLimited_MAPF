@@ -32,6 +32,7 @@ class DeepSetEncoder(ObservationEncoder):
         state_dim: int,
         neighbor_feature_dim: int,
         neighbor_slots: int,
+        observation_horizon: int = 1,
         phi_dims: Iterable[int] = (128, 128),
         rho_dims: Iterable[int] = (128,),
         pool_type: str = "max",
@@ -44,17 +45,23 @@ class DeepSetEncoder(ObservationEncoder):
             raise ValueError(f"'neighbor_feature_dim' must be positive, got {neighbor_feature_dim}.")
         if neighbor_slots < 0:
             raise ValueError(f"'neighbor_slots' must be non-negative, got {neighbor_slots}.")
+        if observation_horizon <= 0:
+            raise ValueError(f"'observation_horizon' must be positive, got {observation_horizon}.")
         if pool_type not in {"sum", "max", "mean"}:
             raise ValueError("pool_type must be one of {'sum', 'max', 'mean'}")
 
         self.state_dim = int(state_dim)
         self.neighbor_feature_dim = int(neighbor_feature_dim)
         self.neighbor_slots = int(neighbor_slots)
-        self.ego_dim = self.state_dim - self.neighbor_slots * (self.neighbor_feature_dim + 1)
-        if self.ego_dim <= 0:
-            raise ValueError("'state_dim' is too small for the packed observation layout.")
+        self.observation_horizon = int(observation_horizon)
+        self.ego_dim = self._compute_ego_dim(
+            self.state_dim, self.neighbor_slots, self.neighbor_feature_dim, self.observation_horizon
+        )
 
-        phi_dims_list = [self.neighbor_feature_dim, *[int(width) for width in phi_dims]]
+        augmented_neighbor_feature_dim = self._augmented_neighbor_feature_dim(
+            self.neighbor_feature_dim, self.observation_horizon
+        )
+        phi_dims_list = [augmented_neighbor_feature_dim, *[int(width) for width in phi_dims]]
         rho_dims_list = [phi_dims_list[-1], *[int(width) for width in rho_dims]]
 
         if len(phi_dims_list) < 2:
@@ -74,15 +81,23 @@ class DeepSetEncoder(ObservationEncoder):
     def forward(self, observation_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
         environment_state = observation_dict.get("observation.environment_state")
         state = observation_dict.get("observation.state")
+        state_mask = observation_dict.get("observation.state_mask")
         raw_neighbors = observation_dict.get("observation.neighbor_state")
         raw_mask = observation_dict.get("observation.neighbor_mask")
-        if environment_state is None or state is None or raw_neighbors is None or raw_mask is None:
+        if (
+            environment_state is None
+            or state is None
+            or state_mask is None
+            or raw_neighbors is None
+            or raw_mask is None
+        ):
             raise ValueError(
-                "observation_dict must contain canonical environment, state, neighbor state, and mask keys."
+                "observation_dict must contain canonical environment, state, state mask, neighbor state, "
+                "and neighbor mask keys."
             )
         if environment_state.ndim != 2 or state.ndim != 2:
             raise ValueError("Environment and state tensors must have shape (B, D).")
-        ego_obs = torch.cat([environment_state, state], dim=-1)
+        ego_obs = torch.cat([environment_state, state, state_mask], dim=-1)
         if ego_obs.ndim != 2 or ego_obs.shape[1] != self.ego_dim:
             raise ValueError(
                 f"Canonical ego features must concatenate to shape (B, {self.ego_dim}), "
@@ -93,17 +108,9 @@ class DeepSetEncoder(ObservationEncoder):
         batch_size = environment_state.shape[0]
         if state.shape[0] != batch_size or raw_neighbors.shape[0] != batch_size or raw_mask.shape[0] != batch_size:
             raise ValueError("Canonical observation tensors must agree on batch dimension.")
-        try:
-            neighbor_obs = raw_neighbors.view(
-                batch_size, -1, self.neighbor_feature_dim
-            )
-            neighbor_mask = raw_mask.view(batch_size, -1, 1)
-        except RuntimeError as exc:
-            raise ValueError(
-                "Flat neighbor tensors do not match the encoder's configured feature dimensions."
-            ) from exc
-        if neighbor_obs.shape[1] != neighbor_mask.shape[1]:
-            raise ValueError("Neighbor state and mask tensors must contain the same number of slots.")
+        neighbor_obs, neighbor_mask = self._split_neighbor_tensors(
+            raw_neighbors, raw_mask, self.neighbor_feature_dim, self.observation_horizon
+        )
 
         max_items = neighbor_obs.shape[1]
         if max_items == 0:
@@ -114,10 +121,11 @@ class DeepSetEncoder(ObservationEncoder):
             )
             return torch.cat([ego_obs, neighbor_context], dim=-1)
 
-        mask_bool = neighbor_mask.bool()
+        mask_bool = neighbor_mask[:, :, -1:].bool()
         row_has_visible = mask_bool.any(dim=(1, 2))
 
-        phi_out = self.phi(neighbor_obs)
+        neighbor_features = self._augment_with_temporal_mask(neighbor_obs, neighbor_mask)
+        phi_out = self.phi(neighbor_features)
 
         if self.pool_type == "max":
             phi_out = phi_out.masked_fill(~mask_bool, float("-inf"))

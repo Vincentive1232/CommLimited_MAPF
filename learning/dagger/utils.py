@@ -43,6 +43,37 @@ def with_seeded_initial_state_config(
     return seeded_config
 
 
+def apply_config_overrides(
+    config: Mapping[str, object],
+    overrides: Mapping[str, object],
+) -> dict[str, object]:
+    """Merge flat key/value overrides into a config dict, per-robot for multi_robot fleets."""
+    merged_config = dict(config)
+    if not overrides:
+        return merged_config
+    if "robots" not in merged_config:
+        merged_config.update(overrides)
+        return merged_config
+    robots_raw = merged_config.get("robots", [])
+    if isinstance(robots_raw, Mapping):
+        shared_config = robots_raw.get("config")
+        robot_cfg = dict(shared_config) if isinstance(shared_config, Mapping) else {}
+        robot_cfg.update(overrides)
+        merged_config["robots"] = {**robots_raw, "config": robot_cfg}
+        return merged_config
+    merged_robots: list[object] = []
+    for robot_entry in robots_raw:
+        if not isinstance(robot_entry, Mapping):
+            merged_robots.append(robot_entry)
+            continue
+        existing_config = robot_entry.get("config")
+        robot_cfg = dict(existing_config) if isinstance(existing_config, Mapping) else {}
+        robot_cfg.update(overrides)
+        merged_robots.append({**robot_entry, "config": robot_cfg})
+    merged_config["robots"] = merged_robots
+    return merged_config
+
+
 def resolve_initial_state_seed(config: Mapping[str, object], fallback_seed: int) -> int:
     return int(config.get("initial_state_seed", fallback_seed))
 
@@ -74,6 +105,42 @@ def print_rollout_metrics(label: str, prefix: str, metrics: DaggerEvalMetrics) -
         f"{prefix}_min_steps={metrics.min_steps} {prefix}_max_steps={metrics.max_steps} "
         f"episodes={metrics.num_episodes}"
     )
+    # Only evaluate_policy_rollouts populates this split (curriculum
+    # initial_states/goal_states vs simulator RNG fallback); other
+    # DaggerEvalMetrics producers (e.g. aggregation's own success
+    # accounting) leave both counts at 0, so there's nothing worth a second
+    # line for them.
+    if metrics.config_num_episodes > 0 or metrics.random_num_episodes > 0:
+        config_rate = (
+            100.0 * metrics.config_successes / metrics.config_num_episodes
+            if metrics.config_num_episodes > 0
+            else None
+        )
+        random_rate = (
+            100.0 * metrics.random_successes / metrics.random_num_episodes
+            if metrics.random_num_episodes > 0
+            else None
+        )
+        config_display = (
+            f"{metrics.config_successes}/{metrics.config_num_episodes} ({config_rate:.1f}%)"
+            if config_rate is not None
+            else "n/a (0 episodes)"
+        )
+        random_display = (
+            f"{metrics.random_successes}/{metrics.random_num_episodes} ({random_rate:.1f}%)"
+            if random_rate is not None
+            else "n/a (0 episodes)"
+        )
+        print(
+            f"  {prefix}_success_by_source: config={config_display} random={random_display}"
+        )
+    total_failures = metrics.collision_failures + metrics.timeout_failures + metrics.solve_failures
+    if total_failures > 0:
+        print(
+            f"  {prefix}_failure_breakdown: collision={metrics.collision_failures} "
+            f"timeout={metrics.timeout_failures} solve_failure={metrics.solve_failures} "
+            f"(of {total_failures} failures)"
+        )
 
 
 def evaluation_seed_specs(
@@ -91,17 +158,20 @@ def evaluation_seed_specs(
     ]
 
 
-def sample_initial_state(simulator: DynamicsProtocol, seed_spec: int | list[int]) -> np.ndarray:
+def rng_for_seed_spec(simulator: DynamicsProtocol, seed_spec: int | list[int]) -> np.random.Generator:
+    """Build the RNG for a seed spec, honoring per-robot seed lists like sample_initial_state does."""
     if isinstance(seed_spec, int):
-        rng = np.random.default_rng(int(seed_spec))
-        simulator.randomize_goal_for_reset(rng)
-        return simulator.random_initial_state(rng)
+        return np.random.default_rng(int(seed_spec))
     sub_simulators = simulator.simulators
     if len(seed_spec) != len(sub_simulators):
         raise ValueError(
             "Per-robot seed specification length must match robot count. "
             f"Got {len(seed_spec)} seeds for {len(sub_simulators)} robots."
         )
-    rng = np.random.default_rng(np.random.SeedSequence([int(robot_seed) for robot_seed in seed_spec]))
+    return np.random.default_rng(np.random.SeedSequence([int(robot_seed) for robot_seed in seed_spec]))
+
+
+def sample_initial_state(simulator: DynamicsProtocol, seed_spec: int | list[int]) -> np.ndarray:
+    rng = rng_for_seed_spec(simulator, seed_spec)
     simulator.randomize_goal_for_reset(rng)
     return simulator.random_initial_state(rng)

@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import torch
 import ast
 import argparse
@@ -14,7 +15,9 @@ sys.path.insert(0, PROJECT_ROOT)
 from core.config import load_and_validate_system_config, validate_system_config
 from core.factory import DynamicsFactory, PlannerFactory
 from systems.initial_state_utils import (
+    normalize_goal_state_specs,
     normalize_initial_state_specs,
+    parse_goal_states_argument,
     parse_initial_states_argument,
 )
 from systems.seed_utils import (
@@ -23,14 +26,13 @@ from systems.seed_utils import (
     default_seed_argument_for_simulator,
 )
 from planning.casadi_planner import PlannerSolveError
-from learning.dagger import build_decentralized_joint_action
-from learning.models.flow_policy import FlowPolicy
-from learning.models.mlp_policy import MLPPolicy
+from learning.dagger import ObservationHistoryBuffer, apply_config_overrides, build_decentralized_joint_action
 from learning.models.encoder import (
     DEFAULT_ENCODER_TYPE,
     EncoderFactory,
     ObservationEncoder,
 )
+from learning.models.policy import ActionPolicy, PolicyFactory
 from planning.planner import PlannerProtocol
 from systems.dynamics import DynamicsProtocol
 
@@ -49,6 +51,105 @@ def evaluation_rollout_title(system: str, policy_display_name: str) -> str:
 
 def is_observation_feature(feature_name: str) -> bool:
     return feature_name.startswith("observation.") or ".observation." in feature_name
+
+
+def detect_collision(simulator: DynamicsProtocol, state: np.ndarray) -> tuple[bool, str]:
+    """Single collision-distance pass; returns (collided, human-readable summary)."""
+    details_fn = getattr(simulator, "collision_details", None)
+    if not callable(details_fn):
+        return bool(simulator.is_collision(state)), "collision details unavailable"
+    details = details_fn(state)
+    if details is None:
+        return False, "collision details unavailable"
+    return True, (
+        f"robots=({details['robot_i']}, {details['robot_j']}), "
+        f"distance={float(details['distance']):.6f}, "
+        f"d_collision={float(details['threshold']):.6f}"
+    )
+
+
+def resolve_checkpoint_observation_dimensions(
+    checkpoint: Mapping[str, Any],
+    simulator: DynamicsProtocol,
+    requested_policy_type: str,
+) -> tuple[int, int, int, int]:
+    """Resolve and validate checkpoint dimensions against the evaluation simulator."""
+    features = simulator.get_dataset_features()
+    runtime_state_dim = sum(
+        int(feature_info["shape"][0])
+        for feature_name, feature_info in features.items()
+        if is_observation_feature(feature_name)
+    )
+    neighbor_slots = max(0, int(simulator.num_robots) - 1)
+    neighbor_state_dim = int(features["observation.neighbor_state"]["shape"][0])
+    runtime_neighbor_feature_dim = (
+        neighbor_state_dim // neighbor_slots if neighbor_slots > 0 else 1
+    )
+
+    # 'flow' and 'safeflow' share the exact same underlying network (safeflow
+    # only wraps it with a CasADi projection at inference time), so a checkpoint
+    # trained under either is interchangeable with the other; 'mlp' is a
+    # genuinely different architecture and stays its own compatibility class.
+    _POLICY_TYPE_EQUIVALENCE = {"flow": {"flow", "safeflow"}, "safeflow": {"flow", "safeflow"}}
+    checkpoint_policy_type = checkpoint.get("policy_type")
+    if checkpoint_policy_type is not None:
+        checkpoint_type_normalized = str(checkpoint_policy_type).lower()
+        compatible_types = _POLICY_TYPE_EQUIVALENCE.get(checkpoint_type_normalized, {checkpoint_type_normalized})
+        if requested_policy_type not in compatible_types:
+            raise ValueError(
+                f"Checkpoint was trained as '{checkpoint_policy_type}', but evaluation requested "
+                f"'{requested_policy_type}'."
+            )
+
+    raw_horizon = checkpoint.get("observation_horizon", 1)
+    observation_horizon = 1 if raw_horizon is None else int(raw_horizon)
+    if observation_horizon <= 0:
+        raise ValueError("Checkpoint 'observation_horizon' must be positive.")
+
+    # observation.state (proprioception) and its companion
+    # observation.state_mask are stacked across observation_horizon like the
+    # neighbor tensors; observation.environment_state (goal-relative
+    # encoding) stays single-frame. Must match learning/train_dagger.py's
+    # identical split exactly, or a correctly-trained checkpoint gets
+    # rejected here.
+    environment_state_dim = int(features["observation.environment_state"]["shape"][0])
+    proprioception_dim = int(features["observation.state"]["shape"][0])
+    state_mask_dim = int(features["observation.state_mask"]["shape"][0])
+    ego_base_dim = environment_state_dim + (proprioception_dim + state_mask_dim) * observation_horizon
+    checkpoint_neighbor_slots = int(checkpoint.get("neighbor_slots", neighbor_slots))
+    neighbor_feature_dim = int(
+        checkpoint.get("neighbor_feature_dim", runtime_neighbor_feature_dim * observation_horizon)
+    )
+    expected_neighbor_feature_dim = (
+        runtime_neighbor_feature_dim * observation_horizon
+        if neighbor_slots > 0
+        else neighbor_feature_dim
+    )
+    if checkpoint_neighbor_slots < 0:
+        raise ValueError("Checkpoint 'neighbor_slots' must be non-negative.")
+    if neighbor_feature_dim != expected_neighbor_feature_dim:
+        raise ValueError(
+            "Checkpoint neighbor feature schema is incompatible with the evaluation simulator: "
+            f"checkpoint=(neighbor_feature_dim={neighbor_feature_dim}, observation_horizon={observation_horizon}), "
+            f"expected=(neighbor_feature_dim={expected_neighbor_feature_dim}, observation_horizon={observation_horizon}). "
+            "The policy can be evaluated with a different number of robots, but the per-neighbor feature schema "
+            "and observation horizon must match."
+        )
+    expected_state_dim = (
+        ego_base_dim
+        + checkpoint_neighbor_slots * neighbor_feature_dim
+        + checkpoint_neighbor_slots * observation_horizon
+    )
+    state_dim = int(checkpoint.get("state_dim", expected_state_dim))
+    if state_dim != expected_state_dim:
+        raise ValueError(
+            "Checkpoint ego observation schema is incompatible with the evaluation simulator: "
+            f"checkpoint=(state_dim={state_dim}, neighbor_slots={checkpoint_neighbor_slots}, "
+            f"neighbor_feature_dim={neighbor_feature_dim}, observation_horizon={observation_horizon}), "
+            f"expected_state_dim={expected_state_dim}. "
+            "Use a checkpoint trained with the same ego observation schema and horizon."
+        )
+    return state_dim, neighbor_feature_dim, checkpoint_neighbor_slots, observation_horizon
 
 
 def infer_mlp_hidden_dims_from_state_dict(state_dict: Mapping[str, torch.Tensor]) -> tuple[int, ...]:
@@ -133,14 +234,12 @@ def normalize_seed_specs(
     return [int(seed) for seed in seeds]  # type: ignore[arg-type]
 
 
-def sample_initial_state(
+def _rng_for_seed_spec(
     simulator: DynamicsProtocol,
     seed_spec: int | list[int],
-) -> np.ndarray:
+) -> np.random.Generator:
     if isinstance(seed_spec, int):
-        rng = np.random.default_rng(seed_spec)
-        simulator.randomize_goal_for_reset(rng)
-        return simulator.random_initial_state(rng)
+        return np.random.default_rng(seed_spec)
 
     sub_simulators = simulator.simulators
     if len(seed_spec) != len(sub_simulators):
@@ -150,9 +249,15 @@ def sample_initial_state(
         )
 
     joint_seed_seq = np.random.SeedSequence([int(robot_seed) for robot_seed in seed_spec])
-    rng = np.random.default_rng(joint_seed_seq)
-    simulator.randomize_goal_for_reset(rng)
+    return np.random.default_rng(joint_seed_seq)
 
+
+def sample_initial_state(
+    simulator: DynamicsProtocol,
+    seed_spec: int | list[int],
+) -> np.ndarray:
+    rng = _rng_for_seed_spec(simulator, seed_spec)
+    simulator.randomize_goal_for_reset(rng)
     return simulator.random_initial_state(rng)
 
 
@@ -166,6 +271,19 @@ def get_inference_device():
         return torch.device("mps")
 
     return torch.device("cpu")
+
+
+def _synchronize_device(device: torch.device) -> None:
+    """Block until pending async accelerator work completes, for fair wall-clock timing.
+
+    Cheap on CPU (no-op). Needed on cuda/mps because kernel launches are
+    asynchronous; without this a timer around a GPU call would measure launch
+    overhead, not actual compute.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def apply_execution_noise(
@@ -202,22 +320,33 @@ def rollout_planner(
     seed_value: Any | None = None,
     initial_state_source: str | None = None,
     action_noise_rng: np.random.Generator | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[float]]:
     """
     Rolls out the expert planner from a given initial state.
+
+    Returns (trajectory, solve_times): solve_times holds one wall-clock
+    duration (seconds) per successful planner solve, for benchmarking the
+    centralized expert against the decentralized policy.
     """
     state = simulator.reset(initial_state)
     planner.reset()
     trajectory = [state.copy()]
+    solve_times: list[float] = []
 
-    if simulator.is_collision(state):
-        return np.asarray(trajectory)
+    collided, summary = detect_collision(simulator, state)
+    if collided:
+        print(
+            "Expert rollout starts in collision "
+            f"(rollout={rollout_id}, {summary})."
+        )
+        return np.asarray(trajectory), solve_times
     if simulator.should_terminate_rollout(state):
-        return np.asarray(trajectory)
+        return np.asarray(trajectory), solve_times
 
     for _ in range(num_steps):
-        obs = simulator.observe(state, validate=False)
-        
+        obs = simulator.observe(state)
+
+        solve_start = time.perf_counter()
         try:
             action = planner(obs)
         except PlannerSolveError as exc:
@@ -225,16 +354,13 @@ def rollout_planner(
             print(
                 "Expert planner failed during evaluation "
                 f"(rollout={rollout_label}, source={initial_state_source}, seed={seed_value}, "
-                f"action_noise_std={action_noise_std:.6f})."
-            )
-            print(
-                "Planner failure context: "
+                f"action_noise_std={action_noise_std:.6f}): {exc} "
                 f"initial_state={np.array2string(np.asarray(initial_state), precision=6)}, "
                 f"current_state={np.array2string(np.asarray(state), precision=6)}, "
                 f"goal_state={np.array2string(np.asarray(simulator.goal_state), precision=6)}"
             )
-            print(f"Underlying solver error: {exc}")
             break
+        solve_times.append(time.perf_counter() - solve_start)
 
         executed_action = apply_execution_noise(
             simulator=simulator,
@@ -242,54 +368,94 @@ def rollout_planner(
             action_noise_std=action_noise_std,
             rng=action_noise_rng,
         )
-        state = simulator.step(state, executed_action, validate=False)
+        state = simulator.step(state, executed_action)
         trajectory.append(state.copy())
 
-        if simulator.is_collision(state):
+        collided, summary = detect_collision(simulator, state)
+        if collided:
+            print(
+                "Expert rollout collision "
+                f"(rollout={rollout_id}, step={len(trajectory) - 1}, "
+                f"{summary})."
+            )
             break
 
         if simulator.should_terminate_rollout(state):
             break
 
-    return np.asarray(trajectory)
+    return np.asarray(trajectory), solve_times
 
 
 def rollout_policy(
     simulator: DynamicsProtocol,
-    policy: MLPPolicy | FlowPolicy,
+    policy: ActionPolicy,
     device: torch.device,
     initial_state: np.ndarray,
     num_steps: int,
     action_noise_std: float = 0.0,
     action_noise_rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, bool, int, bool]:
+    observation_horizon: int = 1,
+) -> tuple[np.ndarray, bool, int, bool, bool, list[float]]:
     """
     Rolls out the neural policy from a given initial state.
-    
+
     returns:
         trajectory: array containing visited simulator states
         reached_goal: whether simulator reached goal state
         steps_taken: number of executed simulation steps
         collided: whether robots collided during the rollout
+        solve_failed: whether the policy's own forward pass raised
+            (e.g. a SafeFlow projector solve failure) instead of the
+            rollout ending in a collision or running out of steps --
+            distinct from both, so callers can report it as its own
+            failure mode instead of folding it into "timeout"
+        solve_times: one wall-clock duration (seconds) per step, for the
+            single batched decentralized call that produces the whole
+            fleet's joint action (all robots at once, not per-robot)
     """
     state = simulator.reset(initial_state)
     trajectory = [state.copy()]
     policy.reset()
-    collided = simulator.is_collision(state)
+    history_buffer = ObservationHistoryBuffer(observation_horizon, int(simulator.num_robots))
+    solve_times: list[float] = []
+    collided, summary = detect_collision(simulator, state)
 
     if collided:
-        return np.asarray(trajectory), False, 0, True
+        print(
+            "Policy rollout starts in collision "
+            f"({summary})."
+        )
+        return np.asarray(trajectory), False, 0, True, False, solve_times
     if simulator.should_terminate_rollout(state):
-        return np.asarray(trajectory), True, 0, False
+        return np.asarray(trajectory), True, 0, False, False, solve_times
 
     for step in range(1, num_steps + 1):
-        observation = simulator.observe(state, validate=False)
-        action = build_decentralized_joint_action(
-            simulator=simulator,
-            policy=policy,
-            observation=observation,
-            device=device,
-        )
+        observation = simulator.observe(state)
+
+        _synchronize_device(device)
+        solve_start = time.perf_counter()
+        try:
+            action = build_decentralized_joint_action(
+                simulator=simulator,
+                policy=policy,
+                observation=observation,
+                device=device,
+                observation_horizon=observation_horizon,
+                history_buffer=history_buffer,
+            )
+        except PlannerSolveError as exc:
+            # No expert running alongside a policy-only rollout to fall back
+            # to -- end the rollout rather than crashing the whole
+            # evaluation run over one solver hiccup with no safe trajectory
+            # yet to lean on. Reported as its own solve_failed outcome
+            # (never collided=True), so a caller doesn't misclassify a
+            # solver hiccup as either a collision or (via collided=False,
+            # reached_goal=False) a timeout.
+            print(f"Policy rollout solve failed (step={step}): {exc}")
+            return np.asarray(trajectory), False, len(trajectory) - 1, False, True, solve_times
+        _synchronize_device(device)
+        solve_times.append(time.perf_counter() - solve_start)
+
         executed_action = apply_execution_noise(
             simulator=simulator,
             action=action,
@@ -297,17 +463,84 @@ def rollout_policy(
             rng=action_noise_rng,
         )
 
-        state = simulator.step(state, executed_action, validate=False)
+        state = simulator.step(state, executed_action)
         trajectory.append(state.copy())
 
-        if simulator.is_collision(state):
+        collision_now, summary = detect_collision(simulator, state)
+        if collision_now:
             collided = True
+            print(
+                "Policy rollout collision "
+                f"(step={step}, {summary})."
+            )
             break
 
         if simulator.should_terminate_rollout(state):
-            return np.asarray(trajectory), True, step, collided
+            return np.asarray(trajectory), True, step, collided, False, solve_times
 
-    return np.asarray(trajectory), False, len(trajectory) - 1, collided
+    return np.asarray(trajectory), False, len(trajectory) - 1, collided, False, solve_times
+
+
+def _load_checkpoint_policy_components(
+    model_dir: str,
+    simulator: DynamicsProtocol,
+    policy_type: str,
+    device: torch.device,
+) -> tuple[
+    Mapping[str, Any],
+    Mapping[str, torch.Tensor],
+    ObservationEncoder,
+    int,
+    tuple[int, ...],
+    int,
+    int,
+]:
+    """Load a metadata checkpoint and resolve its encoder/action/hidden-dim schema.
+
+    Returns (checkpoint, state_dict, obs_encoder, action_dim, hidden_dims,
+    prediction_horizon, observation_horizon).
+    """
+    checkpoint = torch.load(model_dir, map_location=device, weights_only=True)
+    if not (isinstance(checkpoint, dict) and "model_state_dict" in checkpoint):
+        raise ValueError(
+            f"'{policy_type}' models require a metadata checkpoint to infer the prediction_horizon "
+            "and cannot be loaded from raw state dictionaries."
+        )
+    state_dict = checkpoint["model_state_dict"]
+    if not isinstance(state_dict, Mapping):
+        raise ValueError(f"'{policy_type}' checkpoint must contain a state dictionary.")
+
+    hidden_dims = infer_mlp_hidden_dims_from_state_dict(state_dict)
+    prediction_horizon = int(checkpoint.get("prediction_horizon", 1))
+
+    state_dim, neighbor_feature_dim, neighbor_slots, observation_horizon = resolve_checkpoint_observation_dimensions(
+        checkpoint, simulator, policy_type
+    )
+    action_dim = int(checkpoint.get("action_dim", int(simulator.nu)))
+    hidden_dims_raw = checkpoint.get("hidden_dims")
+    if isinstance(hidden_dims_raw, list) and hidden_dims_raw:
+        hidden_dims = tuple(int(width) for width in hidden_dims_raw)
+
+    encoder_type = str(checkpoint.get("encoder_type", DEFAULT_ENCODER_TYPE))
+    encoder_kwargs_raw = checkpoint.get("encoder_kwargs")
+    encoder_kwargs = dict(encoder_kwargs_raw) if isinstance(encoder_kwargs_raw, Mapping) else {}
+    obs_encoder: ObservationEncoder = EncoderFactory.create(
+        encoder_type=encoder_type,
+        state_dim=state_dim,
+        neighbor_feature_dim=neighbor_feature_dim,
+        neighbor_slots=neighbor_slots,
+        observation_horizon=observation_horizon,
+        **encoder_kwargs,
+    )
+    return (
+        checkpoint,
+        state_dict,
+        obs_encoder,
+        action_dim,
+        hidden_dims,
+        prediction_horizon,
+        observation_horizon,
+    )
 
 
 def run_evaluation(
@@ -318,9 +551,14 @@ def run_evaluation(
     num_steps: int = 150,
     seeds: list[int] | list[list[int]] | None = None,
     initial_states: Any | None = None,
+    goal_states: Any | None = None,
+    tolerance_overrides: Mapping[str, float] | None = None,
     action_noise_std: float = 0.0,
     output_path: str | None = None,
+    device_override: str | None = None,
 ):
+    if tolerance_overrides:
+        config = apply_config_overrides(config, tolerance_overrides)
     validated_config = validate_system_config(system_name=system, raw_config=config)
     action_noise_seed = default_action_noise_seed_for_config(validated_config)
 
@@ -330,140 +568,99 @@ def run_evaluation(
         simulator=simulator,
         initial_states=initial_states,
     )
+    goal_state_specs = normalize_goal_state_specs(
+        simulator=simulator,
+        goal_states=goal_states,
+    )
 
     if not os.path.exists(model_dir):
         print(f"assuming '{model_dir}' is a Hugging Face Hub ID")
 
-    device = get_inference_device()
+    device = torch.device(device_override) if device_override else get_inference_device()
     print(f"running inference on {device}")
     print(f"action noise seed: {action_noise_seed}")
 
-    # Dynamically load the requested policy
-    if policy_type == "flow":
-        state_dim = sum(
-            int(feature_info["shape"][0])
-            for feature_name, feature_info in simulator.get_dataset_features().items()
-            if is_observation_feature(feature_name)
-        )
-        action_dim = int(simulator.nu)
-
-        checkpoint = torch.load(model_dir, map_location=device)
-        checkpoint_metadata = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
-        if not checkpoint_metadata:
-            raise ValueError(
-                "Flow models require a metadata checkpoint to infer the prediction_horizon "
-                "and cannot be loaded from raw state dictionaries."
-            )
-        state_dict = checkpoint["model_state_dict"] if checkpoint_metadata else checkpoint
-        if not isinstance(state_dict, Mapping):
-            raise ValueError("Flow checkpoint must contain a state dictionary.")
-
-        hidden_dims = infer_mlp_hidden_dims_from_state_dict(state_dict)
-        prediction_horizon = int(checkpoint.get("prediction_horizon", 1)) if checkpoint_metadata else 1
+    checkpoint, state_dict, obs_encoder, action_dim, hidden_dims, prediction_horizon, observation_horizon = (
+        _load_checkpoint_policy_components(model_dir, simulator, policy_type, device)
+    )
+    policy_kwargs: dict[str, object] = {
+        "action_dim": action_dim,
+        "obs_encoder": obs_encoder,
+        "hidden_dims": hidden_dims,
+        "prediction_horizon": prediction_horizon,
+    }
+    if policy_type in {"flow", "safeflow"}:
         num_inference_steps = 10
-        neighbor_feature_dim = 2
-        neighbor_slots = max(0, int(simulator.num_robots) - 1)
-        
-        if checkpoint_metadata:
-            state_dim = int(checkpoint.get("state_dim", state_dim))
-            action_dim = int(checkpoint.get("action_dim", action_dim))
-            hidden_dims_raw = checkpoint.get("hidden_dims")
-            if isinstance(hidden_dims_raw, list) and hidden_dims_raw:
-                hidden_dims = tuple(int(width) for width in hidden_dims_raw)
-            flow_config_raw = checkpoint.get("flow_config")
-            if isinstance(flow_config_raw, Mapping):
-                num_inference_steps = int(flow_config_raw.get("num_inference_steps", 10))
-        
-        neighbor_feature_dim = int(checkpoint.get("neighbor_feature_dim", neighbor_feature_dim)) if checkpoint_metadata else neighbor_feature_dim
-        neighbor_slots = int(checkpoint.get("neighbor_slots", neighbor_slots)) if checkpoint_metadata else neighbor_slots
-        encoder_type = str(checkpoint.get("encoder_type", DEFAULT_ENCODER_TYPE)) if checkpoint_metadata else DEFAULT_ENCODER_TYPE
-        encoder_kwargs_raw = checkpoint.get("encoder_kwargs") if checkpoint_metadata else {}
-        encoder_kwargs = dict(encoder_kwargs_raw) if isinstance(encoder_kwargs_raw, Mapping) else {}
-        obs_encoder: ObservationEncoder = EncoderFactory.create(
-            encoder_type=encoder_type,
-            state_dim=state_dim,
-            neighbor_feature_dim=neighbor_feature_dim,
-            neighbor_slots=neighbor_slots,
-            **encoder_kwargs,
-        )
+        flow_config_raw = checkpoint.get("flow_config")
+        if isinstance(flow_config_raw, Mapping):
+            num_inference_steps = int(flow_config_raw.get("num_inference_steps", 10))
+            # Absent on a checkpoint saved before per-dimension action
+            # normalization existed -- FlowPolicy's own default (all-ones,
+            # a no-op) is exactly what such a checkpoint was actually
+            # trained against, so leaving the kwarg unset there (rather
+            # than substituting today's live simulator's max_action) is
+            # what keeps it loadable and correct, not a fallback that
+            # happens to be convenient.
+            action_scale_raw = flow_config_raw.get("action_scale")
+            if action_scale_raw is not None:
+                policy_kwargs["action_scale"] = list(action_scale_raw)
+        policy_kwargs["num_inference_steps"] = num_inference_steps
+    if policy_type == "safeflow":
+        policy_kwargs["simulator"] = simulator
+        policy_kwargs["planner_config"] = validated_config
 
-        policy = FlowPolicy(
-            action_dim=action_dim,
-            obs_encoder=obs_encoder,
-            hidden_dims=hidden_dims,
-            prediction_horizon=prediction_horizon,
-            num_inference_steps=num_inference_steps,
-        )
-        policy.load_state_dict(state_dict)
-
-        policy_display_name = "Flow"
-    elif policy_type == "mlp":
-        state_dim = sum(
-            int(feature_info["shape"][0])
-            for feature_name, feature_info in simulator.get_dataset_features().items()
-            if is_observation_feature(feature_name)
-        )
-        action_dim = int(simulator.nu)
-
-        checkpoint = torch.load(model_dir, map_location=device)
-        checkpoint_metadata = isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
-        if not checkpoint_metadata:
-            raise ValueError(
-                "MLP models require a metadata checkpoint to infer the prediction_horizon "
-                "and cannot be loaded from raw state dictionaries."
-            )
-        state_dict = checkpoint["model_state_dict"] if checkpoint_metadata else checkpoint
-        if not isinstance(state_dict, Mapping):
-            raise ValueError("MLP checkpoint must contain a state dictionary.")
-
-        hidden_dims = infer_mlp_hidden_dims_from_state_dict(state_dict)
-        prediction_horizon = int(checkpoint.get("prediction_horizon", 1)) if checkpoint_metadata else 1
-        neighbor_feature_dim = 2
-        neighbor_slots = max(0, int(simulator.num_robots) - 1)
-        
-        if checkpoint_metadata:
-            state_dim = int(checkpoint.get("state_dim", state_dim))
-            action_dim = int(checkpoint.get("action_dim", action_dim))
-            hidden_dims_raw = checkpoint.get("hidden_dims")
-            if isinstance(hidden_dims_raw, list) and hidden_dims_raw:
-                hidden_dims = tuple(int(width) for width in hidden_dims_raw)
-        
-        neighbor_feature_dim = int(checkpoint.get("neighbor_feature_dim", neighbor_feature_dim)) if checkpoint_metadata else neighbor_feature_dim
-        neighbor_slots = int(checkpoint.get("neighbor_slots", neighbor_slots)) if checkpoint_metadata else neighbor_slots
-        encoder_type = str(checkpoint.get("encoder_type", DEFAULT_ENCODER_TYPE)) if checkpoint_metadata else DEFAULT_ENCODER_TYPE
-        encoder_kwargs_raw = checkpoint.get("encoder_kwargs") if checkpoint_metadata else {}
-        encoder_kwargs = dict(encoder_kwargs_raw) if isinstance(encoder_kwargs_raw, Mapping) else {}
-        obs_encoder: ObservationEncoder = EncoderFactory.create(
-            encoder_type=encoder_type,
-            state_dim=state_dim,
-            neighbor_feature_dim=neighbor_feature_dim,
-            neighbor_slots=neighbor_slots,
-            **encoder_kwargs,
-        )
-
-        policy = MLPPolicy(
-            action_dim=action_dim,
-            obs_encoder=obs_encoder,
-            hidden_dims=hidden_dims,
-            prediction_horizon=prediction_horizon,
-        )
-        policy.load_state_dict(state_dict)
-
-        policy_display_name = "MLP"
-    else:
-        raise ValueError("'policy_type' must be one of {'mlp', 'flow'}.")
+    policy = PolicyFactory.create(policy_type, **policy_kwargs)
+    policy.load_state_dict(state_dict)
+    policy_display_name = policy_type.title()
 
     policy.eval()
     policy.to(device)
+
+    # torch.compile(...) on FlowPolicy.net (see FlowPolicy.__init__) and,
+    # for safeflow, SafeFlowMPCPolicy's ThreadPoolExecutor worker threads
+    # are both lazily initialized on the *first* real select_action call --
+    # without this untimed warm-up, that one-time cost would land inside
+    # the very first sample of the timed solve_times benchmark below, which
+    # can dominate (or even define) the reported mean for a short
+    # evaluation. The state/observation values themselves are irrelevant
+    # (this call's action is discarded) so an all-zero state is fine; reset
+    # afterward so this doesn't leave the policy's own internal state
+    # (e.g. a SafeFlow projector's warm-start cache) primed for it.
+    warmup_history_buffer = (
+        ObservationHistoryBuffer(observation_horizon, int(simulator.num_robots))
+        if observation_horizon > 1
+        else None
+    )
+    try:
+        build_decentralized_joint_action(
+            simulator=simulator,
+            policy=policy,
+            observation=simulator.observe(np.zeros(simulator.nx)),
+            device=device,
+            observation_horizon=observation_horizon,
+            history_buffer=warmup_history_buffer,
+        )
+    except PlannerSolveError:
+        # All-zero is a valid *shape* for any system, but for multi_robot it
+        # puts every robot at the exact same position -- a guaranteed
+        # collision-constraint violation, which SafeFlow's projector (with
+        # no warm-start cache yet to fall back on) can't solve around. Both
+        # of this warm-up's actual goals (compiling FlowPolicy.net, spawning
+        # the projector thread pool) already happened before the projection
+        # itself raised, so a failed solve here is harmless -- the point was
+        # never this call's returned action.
+        pass
+    policy.reset()
 
     # Instantiate expert planner once and reset it for each rollout.
     expert_planner = PlannerFactory.create(planner_name="casadi", simulator=simulator, config=validated_config)
     expert_trajectories: list[np.ndarray] = []
     policy_trajectories: list[np.ndarray] = []
+    rollout_goal_states: list[np.ndarray] = []
     per_seed_metrics: list[dict[str, Any]] = []
 
     if len(initial_state_specs) > 0:
-        total_rollouts = max(len(seed_specs), len(initial_state_specs))
+        total_rollouts = max(len(seed_specs), len(initial_state_specs), len(goal_state_specs))
         print(
             "evaluating "
             f"{total_rollouts} trajectories "
@@ -498,30 +695,51 @@ def run_evaluation(
 
             rollout_plan.append((initial_state_spec, initial_state_source, torch_seed, seed_value, noise_seed_spec))
     else:
-        print(f"evaluating {len(seed_specs)} seeded trajectories")
+        total_rollouts = max(len(seed_specs), len(goal_state_specs))
+        print(f"evaluating {total_rollouts} trajectories ({len(seed_specs)} seeded + goal/RNG fallback)")
         rollout_plan = []
-        for seed_spec in seed_specs:
-            torch_seed = int(seed_spec) if isinstance(seed_spec, int) else int(seed_spec[0])
-            rollout_plan.append(
-                (
-                    seed_spec,
-                    "seeded",
-                    torch_seed,
-                    seed_spec,
-                    seed_spec,
-                )
-            )
+        for rollout_idx in range(total_rollouts):
+            if rollout_idx < len(seed_specs):
+                seed_spec = seed_specs[rollout_idx]
+                torch_seed = int(seed_spec) if isinstance(seed_spec, int) else int(seed_spec[0])
+                rollout_plan.append((seed_spec, "seeded", torch_seed, seed_spec, seed_spec))
+            else:
+                rollout_plan.append((None, "rng_fallback", rollout_idx + 1, None, None))
 
+    baseline_goal = simulator.goal.copy()
     for rollout_idx, (rollout_spec, initial_state_source, torch_seed, seed_value, noise_seed_spec) in enumerate(rollout_plan, start=1):
         torch.manual_seed(torch_seed)
 
+        explicit_goal = rollout_idx - 1 < len(goal_state_specs)
+        if explicit_goal:
+            simulator.set_goal(goal_state_specs[rollout_idx - 1])
+        else:
+            # A prior rollout's explicit goal mutates the simulator; restore the
+            # config's baseline goal before any fallback sampling, since
+            # randomize_goal_for_reset() is a no-op under `randomize_goal: false`
+            # and would otherwise silently leak that leftover explicit goal into
+            # this rollout instead of the configured/default one.
+            simulator.set_goal(baseline_goal)
+
         if initial_state_source == "seeded":
             seed_spec = rollout_spec
-            initial_state = sample_initial_state(simulator=simulator, seed_spec=seed_spec)
+            if explicit_goal:
+                initial_state = simulator.random_initial_state(_rng_for_seed_spec(simulator, seed_spec))
+            else:
+                initial_state = sample_initial_state(simulator=simulator, seed_spec=seed_spec)
         elif initial_state_source == "provided":
+            if not explicit_goal:
+                simulator.randomize_goal_for_reset(
+                    _rng_for_seed_spec(simulator, noise_seed_spec)
+                    if noise_seed_spec is not None
+                    else np.random.default_rng(torch_seed)
+                )
             initial_state = simulator.validate_state(rollout_spec).copy()
         else:
-            initial_state = simulator.reset_random().copy()
+            if explicit_goal:
+                initial_state = simulator.reset_random_state_only().copy()
+            else:
+                initial_state = simulator.reset_random().copy()
 
         if noise_seed_spec is not None:
             rollout_noise_seed = action_noise_seed_for_rollout(
@@ -539,7 +757,7 @@ def run_evaluation(
 
         goal_state = simulator.goal_state.copy()
 
-        expert_trajectory = rollout_planner(
+        expert_trajectory, expert_solve_times = rollout_planner(
             simulator=simulator,
             planner=expert_planner,
             initial_state=initial_state,
@@ -551,7 +769,7 @@ def run_evaluation(
             action_noise_rng=expert_action_noise_rng,
         )
 
-        policy_trajectory, reached_goal, steps_taken, policy_collided = rollout_policy(
+        policy_trajectory, reached_goal, steps_taken, policy_collided, policy_solve_failed, policy_solve_times = rollout_policy(
             simulator=simulator,
             policy=policy,
             device=device,
@@ -559,8 +777,23 @@ def run_evaluation(
             num_steps=num_steps,
             action_noise_std=action_noise_std,
             action_noise_rng=policy_action_noise_rng,
+            observation_horizon=observation_horizon,
         )
         expert_collided = simulator.is_collision(expert_trajectory[-1])
+
+        # policy_solve_times measures one batched call per step that produces
+        # the WHOLE fleet's joint action at once; dividing by robot count
+        # gives an amortized per-robot figure comparable to the expert's
+        # single centralized (whole-fleet) solve per step -- not a true
+        # isolated single-robot measurement, since a real decentralized
+        # deployment would run each robot's solve independently in parallel
+        # on its own onboard compute rather than as one shared batched call.
+        num_robots = int(simulator.num_robots)
+        expert_solve_time_mean = float(np.mean(expert_solve_times)) if expert_solve_times else None
+        policy_solve_time_mean = float(np.mean(policy_solve_times)) if policy_solve_times else None
+        policy_solve_time_mean_per_robot = (
+            policy_solve_time_mean / num_robots if policy_solve_time_mean is not None else None
+        )
 
         policy_final_state = policy_trajectory[-1]
         expert_final_state = expert_trajectory[-1]
@@ -569,6 +802,7 @@ def run_evaluation(
 
         expert_trajectories.append(expert_trajectory)
         policy_trajectories.append(policy_trajectory)
+        rollout_goal_states.append(goal_state)
         per_seed_metrics.append(
             {
                 "seed": seed_value,
@@ -577,11 +811,22 @@ def run_evaluation(
                 "initial_state": initial_state,
                 "policy_reached_goal": reached_goal,
                 "policy_collided": policy_collided,
+                "policy_solve_failed": policy_solve_failed,
                 "expert_collided": expert_collided,
                 "policy_steps": max(len(policy_trajectory) - 1, 0),
                 "expert_steps": max(len(expert_trajectory) - 1, 0),
                 "policy_goal_error_l2": policy_goal_error,
                 "expert_goal_error_l2": expert_goal_error,
+                "expert_solve_time_mean_s": expert_solve_time_mean,
+                "policy_solve_time_mean_s": policy_solve_time_mean,
+                "policy_solve_time_mean_s_per_robot": policy_solve_time_mean_per_robot,
+                # Raw per-step samples, kept alongside the per-rollout means
+                # above so the aggregate below can be a true per-step mean
+                # (weighted by each rollout's own step count) rather than an
+                # unweighted mean of per-rollout means, which would let a
+                # 1-step rollout outvote a 200-step one.
+                "expert_solve_times": expert_solve_times,
+                "policy_solve_times": policy_solve_times,
             }
         )
 
@@ -604,6 +849,21 @@ def run_evaluation(
     mean_expert_steps = float(
         np.mean([metric["expert_steps"] for metric in per_seed_metrics])
     ) if total_runs > 0 else 0.0
+
+    def _pooled_mean_or_none(key: str) -> float | None:
+        # Pools every rollout's raw per-step samples into one list before
+        # averaging, so each executed step counts once -- an unweighted
+        # mean of per-rollout means would give a 1-step rollout the same
+        # weight as a 200-step one.
+        pooled = [t for metric in per_seed_metrics for t in metric[key]]
+        return float(np.mean(pooled)) if pooled else None
+
+    num_robots = int(simulator.num_robots)
+    mean_expert_solve_time = _pooled_mean_or_none("expert_solve_times")
+    mean_policy_solve_time = _pooled_mean_or_none("policy_solve_times")
+    mean_policy_solve_time_per_robot = (
+        mean_policy_solve_time / num_robots if mean_policy_solve_time is not None else None
+    )
 
     print("\n--- Evaluation Summary ---")
     print(f"system: {system}")
@@ -633,12 +893,50 @@ def run_evaluation(
         np.mean([metric["expert_collided"] for metric in per_seed_metrics])
         if total_runs > 0 else 0.0
     )
+    # A run that neither reached the goal nor collided nor hit a solve
+    # failure ran out of steps -- tracked separately since "timed out while
+    # still avoiding", "collided outright", and "the policy's own forward
+    # pass raised" are different (and not equally bad) failure modes that
+    # success_rate alone can't distinguish.
+    policy_solve_failure_rate = (
+        np.mean([metric["policy_solve_failed"] for metric in per_seed_metrics])
+        if total_runs > 0 else 0.0
+    )
+    policy_timeout_rate = (
+        np.mean(
+            [
+                (not metric["policy_reached_goal"])
+                and (not metric["policy_collided"])
+                and (not metric["policy_solve_failed"])
+                for metric in per_seed_metrics
+            ]
+        )
+        if total_runs > 0 else 0.0
+    )
     print(f"policy_collision_rate: {policy_collision_rate:.4f}")
+    print(f"policy_timeout_rate: {policy_timeout_rate:.4f}")
+    print(f"policy_solve_failure_rate: {policy_solve_failure_rate:.4f}")
     print(f"expert_collision_rate: {expert_collision_rate:.4f}")
     print(f"mean_policy_steps: {mean_policy_steps:.3f}")
     print(f"mean_expert_steps: {mean_expert_steps:.3f}")
     print(f"mean_policy_goal_error_l2: {mean_policy_error:.6f}")
     print(f"mean_expert_goal_error_l2: {mean_expert_error:.6f}")
+
+    def _fmt_solve_time(value: float | None) -> str:
+        return f"{value * 1000.0:.3f} ms" if value is not None else "n/a"
+
+    print(
+        f"mean_expert_solve_time (centralized, joint solve for all {num_robots} robots): "
+        f"{_fmt_solve_time(mean_expert_solve_time)} / step"
+    )
+    print(
+        f"mean_policy_solve_time (decentralized, single batched call for all {num_robots} robots): "
+        f"{_fmt_solve_time(mean_policy_solve_time)} / step"
+    )
+    print(
+        f"mean_policy_solve_time_per_robot (amortized, batched call / {num_robots} robots): "
+        f"{_fmt_solve_time(mean_policy_solve_time_per_robot)} / robot / step"
+    )
 
     # Dynamically set output names
     output_path = output_path or default_evaluation_output_path(
@@ -658,6 +956,10 @@ def run_evaluation(
         path_labels[num_expert] = f"{policy_display_name} Policy"
     trajectory_colors = ["tab:blue"] * num_expert + ["tab:orange"] * num_policy
     trajectory_line_styles = ["--"] * num_expert + ["-"] * num_policy
+    # rollout_goal_states holds one goal per rollout; expert and policy trajectories
+    # from the same rollout share it, and all_trajectories concatenates expert then
+    # policy in rollout order, so the goal list must be duplicated the same way.
+    all_goal_states = rollout_goal_states + rollout_goal_states
 
     show_heading = not simulator.is_euclidean
 
@@ -671,6 +973,7 @@ def run_evaluation(
         marker="o",
         trajectory_colors=trajectory_colors,
         trajectory_line_styles=trajectory_line_styles,
+        goal_states=all_goal_states,
     )
     print(f"Plot saved to {output_path}")
 
@@ -685,6 +988,7 @@ def run_evaluation(
         trajectory_colors=trajectory_colors,
         trajectory_line_styles=trajectory_line_styles,
         phase_lengths=[num_expert, num_policy],
+        goal_states=all_goal_states,
     )
     if video_path is not None:
         print(f"Video saved to {video_path}")
@@ -701,11 +1005,16 @@ def run_evaluation(
         "policy_successes": total_successes,
         "success_rate": success_rate,
         "policy_collision_rate": float(policy_collision_rate),
+        "policy_timeout_rate": float(policy_timeout_rate),
+        "policy_solve_failure_rate": float(policy_solve_failure_rate),
         "expert_collision_rate": float(expert_collision_rate),
         "mean_policy_steps": mean_policy_steps,
         "mean_expert_steps": mean_expert_steps,
         "mean_policy_goal_error_l2": mean_policy_error,
         "mean_expert_goal_error_l2": mean_expert_error,
+        "mean_expert_solve_time_s": mean_expert_solve_time,
+        "mean_policy_solve_time_s": mean_policy_solve_time,
+        "mean_policy_solve_time_s_per_robot": mean_policy_solve_time_per_robot,
         "per_seed": per_seed_metrics,
         "plot_path": output_path,
         "video_path": video_path,
@@ -730,7 +1039,7 @@ def main():
     parser.add_argument(
         "--policy-type",
         type=str.lower,
-        choices=["mlp", "flow"],
+        choices=["mlp", "flow", "safeflow"],
         required=True,
         help="the type of policy architecture to evaluate",
     )
@@ -773,6 +1082,28 @@ def main():
         ),
     )
     parser.add_argument(
+        "--goal-states",
+        type=str,
+        default=None,
+        help=(
+            "explicit goal state specs, independently indexed from --initial-states. "
+            "Examples: '[x, y, ...]' for one rollout, '[[...], [...]]' for multiple global goals, or "
+            "'[[[robot1...], [robot2...]], ...]' for multi-robot rollouts. "
+            "When exhausted, evaluation falls back to simulator RNG sampling."
+        ),
+    )
+    parser.add_argument(
+        "--tolerance-overrides",
+        type=str,
+        default=None,
+        help=(
+            "per-run override for the expert config's convergence tolerances, as a Python-literal "
+            "dict matching the target system's tolerance keys, e.g. "
+            "'{\"pos_tol\": 0.2, \"theta_tol\": 1.1, \"vel_tol\": 0.05, \"omega_tol\": 0.05}' for unicycle2, "
+            "or '{\"error_tolerance\": 0.05}' for single_integrator/double_integrator/unicycle1."
+        ),
+    )
+    parser.add_argument(
         "--action-noise-std",
         type=float,
         default=0.0,
@@ -787,9 +1118,29 @@ def main():
         default=None,
         help="path to generated PDF plot",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda", "mps"],
+        help=(
+            "override automatic device selection. For small robot fleets, CPU can "
+            "outperform mps/cuda due to per-call dispatch overhead dominating actual "
+            "compute -- use the printed solve-time benchmark to compare."
+        ),
+    )
 
     args = parser.parse_args()
     config = load_and_validate_system_config(system_name=args.system, config_path=args.config)
+
+    tolerance_overrides = None
+    if args.tolerance_overrides:
+        try:
+            tolerance_overrides = ast.literal_eval(args.tolerance_overrides)
+        except (SyntaxError, ValueError) as exc:
+            parser.error(f"Unable to parse --tolerance-overrides: {exc}")
+        if not isinstance(tolerance_overrides, dict):
+            parser.error("--tolerance-overrides must evaluate to a dict.")
 
     run_evaluation(
         system=args.system,
@@ -799,8 +1150,11 @@ def main():
         num_steps=args.num_steps,
         seeds=parse_seed_argument(args.seeds),
         initial_states=parse_initial_states_argument(args.initial_states),
+        goal_states=parse_goal_states_argument(args.goal_states),
+        tolerance_overrides=tolerance_overrides,
         action_noise_std=args.action_noise_std,
         output_path=args.output_path,
+        device_override=args.device,
     )
 
 
