@@ -1,0 +1,5 @@
+dynamics: integrator1_2d
+shape: sphere
+radius: 0.30
+dt: 0.1
+max_vel: 1.0

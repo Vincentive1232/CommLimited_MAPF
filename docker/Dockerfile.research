@@ -119,6 +119,7 @@ ENV CMAKE_PREFIX_PATH="/opt/ompl;/opt/openrobots"
 ENV LD_LIBRARY_PATH="/opt/ompl/lib:/opt/openrobots/lib"
 
 COPY third_party/db-lacam/ /opt/db-lacam/
+COPY configs/models/integrator1_2d_v0.yaml /opt/db-lacam/dynoplan/dynobench/models/integrator1_2d_v0.yaml
 
 RUN /usr/bin/cmake \
         -S "${DB_LACAM_ROOT}" \
