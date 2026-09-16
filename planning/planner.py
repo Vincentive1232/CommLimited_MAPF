@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Protocol, runtime_checkable
 
 import numpy as np
+from .results import ExpertPlanResult, PlannerError
 
 
 @runtime_checkable
@@ -36,3 +37,32 @@ class Planner(ABC):
         Compute and return the next action based on the current observation.
         """
         pass
+
+
+    def plan_episode(
+        self,
+        initial_joint_state,
+        goals,
+        environment,
+        *,
+        time_limit_s: float,
+    ) -> ExpertPlanResult:
+        """从一个联合状态（多个机器人的位置）开始规划完整轨迹"""
+        raise PlannerError(
+            f"{type(self).__name__} does not implement plan_episode"
+        )
+
+
+    def query_action(
+        self,
+        current_joint_state,
+        goals,
+        environment,
+        *,
+        horizon: int,
+        time_limit_s: float,
+    ) -> ExpertPlanResult:
+        """从当前联合状态查询指定控制步数的expert action sequence"""
+        raise PlannerError(
+            f"{type(self).__name__} does not implement query_action"
+        )
